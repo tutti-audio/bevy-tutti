@@ -2,189 +2,78 @@
 //! `tutti-graph` [`Editor`], and — until the engine or a test takes it — the
 //! [`Executor`] it sends to.
 //!
-//! Design doc 013, Phase 3: added beside fundsp's `Net` in PR 11, the only
-//! runtime since PR 13. Every method here answers one of `AudioGraphRes`'s,
-//! and the mapping is:
+//! Every method here answers one of `AudioGraphRes`'s, and the mapping is:
 //!
 //! | `AudioGraphRes` | here |
 //! |---|---|
-//! | `insert`, `insert_with` | `Legacy::controlled` at a [`NodeKey`] minted from a fresh `NodeId`, forking as its captured MIDI port asks |
+//! | `insert` | `Editor::insert` of the node's own [`IntoNode`] at a [`NodeKey`] minted by `AudioNode::fresh`, its controls handed back |
 //! | `set_source`, `set_output_source`, `widen_outputs` | written into `editor.spec_mut()` |
-//! | `set_param` | the node's `LegacyControls` (its settings ring, and its shadow) |
-//! | `replace` | `Editor::replace` with a [`Fade`]; a plain `insert` when there is nothing to fade from |
+//! | `set_param` | the node's [`ParamSet`], when it has one |
+//! | `replace` | `Editor::replace_or_swap` with a [`Fade`]: a plain swap when there is nothing to fade from |
 //! | `node_latency`, `node_tail`, `node_inputs`, `node_outputs` | the editor's [`Shapes`](tutti_graph::Shapes) |
-//! | `latency_plan` | `tutti_types::latency::plan` over the spec's topology |
+//! | `latency_plan` | `tutti_types::latency::plan` over the whole spec: audio edges plus event and param-modulation sources |
 //! | `compensate` | compiles the spec, reads `Plan::compensation` / `total_latency`; inserts nothing |
 //! | `commit` | `Editor::commit`, which collects first |
 //! | `set_node_latency` | `Editor::set_latency` |
-//! | `insert_plugin`, `replace_plugin` | the bound `PluginClient` itself, a native node with its own fork source |
+//! | `insert_plugin`, `replace_plugin` | the bound `PluginClient` itself, a node with its own fork source |
 //! | `export` | `Editor::fork` in `ForkMode::Offline`, through `tutti_export::RenderGraph::fork` |
-//!
-//! # Every unit is `controlled`, none `pure`
-//!
-//! `insert` takes any `AudioUnit`, and nothing about one says whether its
-//! output is a function of its audio inputs alone — a SoundFont fed through
-//! its MIDI port looks exactly like a filter from here. A `pure` claim that is
-//! wrong parks the unit for good the first time it is quiet (`tutti_graph`'s
-//! `legacy` module docs), so this adapter never makes one: every unit is
-//! [`Legacy::controlled`], which runs every block and gives `set_param` its
-//! settings ring. The price is the silence skip, which the `Net` this
-//! replaced never had either.
 //!
 //! # Where the audio side lives
 //!
 //! `Editor::new` builds the pair. The executor stays here ("local") until
-//! [`take_executor`](NativeGraph::take_executor) hands it to the engine or to
+//! [`take_executor`](GraphRuntime::take_executor) hands it to the engine or to
 //! a test's [`AudioSide`](super::AudioSide). While it is local, a commit is
 //! applied at once on this thread and its box collected, so a headless graph
-//! never meets back-pressure, and [`render_frame`](NativeGraph::render_frame)
+//! never meets back-pressure, and [`render_frame`](GraphRuntime::render_frame)
 //! runs it.
 //!
 //! # `set_param` lands on the next block, never at once
 //!
-//! There is no control-side copy of a node for a setting to land on at once
-//! (a `Net` with no audio side, before PR 13, applied one straight to its only
-//! copy, so a test could read an atomic back the moment it wrote it). A
-//! setting goes into the node's ring and reaches the unit at the start of
-//! the executor's next block: one block later, on every graph. A test that
-//! reads a unit's live state after a write renders a frame first
-//! ([`render_frame`](super::AudioGraphRes::render_frame)); one that reads the
-//! by-value state reads the shadow through
-//! [`inspect`](super::AudioGraphRes::inspect), which every setting reaches at
-//! once.
+//! There is no control-side copy of a node for a setting to land on at once.
+//! A write goes into the node's own `Param` cell through its [`ParamSet`], and
+//! the node reads it at the start of the executor's next block: one block
+//! later, on every graph. A test that reads what a write did renders a frame
+//! first ([`render_frame`](super::AudioGraphRes::render_frame)).
 
 use std::collections::BTreeMap;
 
-use tutti_core::dsp::NodeId;
-use tutti_core::{
-    AudioNode, AudioUnit, BufferMut, BufferRef, Compensation, CrossfadeCurve, EnvClock, Samples,
-    Tail,
-};
+use tutti_core::{AudioNode, Compensation, CrossfadeCurve, Samples, Tail};
 use tutti_graph::{
-    CommitError, Editor, Executor, Fade, GraphInvalid, Legacy, LegacyControls, NodeParts,
-    ParamFrom, ParamIn, ParamMod, ParamRange, ParamShaping, Prepare, Resolution, Transport,
+    CommitError, Editor, EventEdge, EventIn, EventOut, Executor, Fade, GraphInvalid, IntoNode,
+    ParamFrom, ParamIn, ParamMod, ParamRange, ParamSet, ParamShaping, Prepare, Transport,
     MAX_PARAM_SOURCES,
 };
-use tutti_node::{AttoHash, Setting, SignalFrame};
 use tutti_types::graph::{Edge, InPort, NodeKey, OutPort, Source};
-use tutti_types::{ChannelLayout, Latency, SampleRate, Seconds, UnitParam};
+#[cfg(feature = "plugin")]
+use tutti_types::Latency;
+use tutti_types::{ChannelLayout, SampleRate, Seconds, UnitParam};
 
 use super::resources::GraphSource;
 
-/// The largest block the native graph is prepared for.
+/// The largest block the graph is prepared for.
 ///
 /// A device block longer than this is rendered by `tutti_core::Engine` as
 /// consecutive graph blocks of at most this many frames, so it bounds the
 /// arena, not the device. 1024 frames covers every buffer size a DAW offers
-/// by default; `Legacy` still runs each unit in 64-frame chunks inside it.
-pub(crate) const NATIVE_MAX_BLOCK: Samples = Samples(1024);
+/// by default.
+pub(crate) const LIVE_MAX_BLOCK: Samples = Samples(1024);
 
-/// The spec `kind` of a unit this adapter inserted. Nothing builds a unit from
-/// it (the same reason `topology::ENTITY_NODE_KIND` exists); it names the
-/// layer in a debugger.
-const UNIT_KIND: &str = "bevy-tutti:unit";
-
-/// The spec `kind` of a hosted plugin, a native node.
+/// The spec `kind` of a hosted plugin.
 #[cfg(feature = "plugin")]
 const PLUGIN_KIND: &str = "bevy-tutti:plugin";
 
-/// The spec `kind` of the engine's beat generator.
-const ENV_CLOCK_KIND: &str = "bevy-tutti:env-clock";
-
-/// A boxed unit as a sized, `Clone` one, which is what `Legacy::controlled`
-/// takes (its shadow is a clone). Every method forwards, the defaulted ones
-/// included — a forwarding wrapper that let `isolate`, `forkable` or
-/// `latency` fall back to the trait default would silently change what the
-/// graph believes about the unit (a plugin would become forkable, a limiter
-/// latency-free). `as_any` forwards too, so a downcast through
-/// [`inspect`](super::AudioGraphRes::inspect) sees the unit, not this.
-#[derive(Clone)]
-pub(crate) struct Boxed(pub(crate) Box<dyn AudioUnit>);
-
-impl AudioUnit for Boxed {
-    fn reset(&mut self) {
-        self.0.reset();
-    }
-    fn isolate(&mut self) {
-        self.0.isolate();
-    }
-    fn rebind_offline(&mut self, ctx: &tutti_core::transport::OfflineTransport) {
-        self.0.rebind_offline(ctx);
-    }
-    fn forkable(&self) -> bool {
-        self.0.forkable()
-    }
-    fn render_fault(&self) -> Option<std::sync::Arc<dyn tutti_core::RenderFault>> {
-        self.0.render_fault()
-    }
-    fn param_feed(&mut self) -> Option<&mut tutti_core::ParamFeed> {
-        self.0.param_feed()
-    }
-    fn param_base(&self, k: usize) -> Option<f32> {
-        self.0.param_base(k)
-    }
-    fn set_sample_rate(&mut self, sample_rate: SampleRate) {
-        self.0.set_sample_rate(sample_rate);
-    }
-    fn tick(&mut self, input: &[f32], output: &mut [f32]) {
-        self.0.tick(input, output);
-    }
-    fn process(&mut self, size: usize, input: &BufferRef, output: &mut BufferMut) {
-        self.0.process(size, input, output);
-    }
-    fn set(&mut self, setting: Setting) {
-        self.0.set(setting);
-    }
-    fn inputs(&self) -> usize {
-        self.0.inputs()
-    }
-    fn outputs(&self) -> usize {
-        self.0.outputs()
-    }
-    fn route(&mut self, input: &SignalFrame, frequency: f64) -> SignalFrame {
-        self.0.route(input, frequency)
-    }
-    fn get_id(&self) -> u64 {
-        self.0.get_id()
-    }
-    fn as_any(&self) -> &dyn core::any::Any {
-        self.0.as_any()
-    }
-    fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
-        self.0.as_any_mut()
-    }
-    fn set_hash(&mut self, hash: u64) {
-        self.0.set_hash(hash);
-    }
-    fn ping(&mut self, probe: bool, hash: AttoHash) -> AttoHash {
-        self.0.ping(probe, hash)
-    }
-    fn footprint(&self) -> usize {
-        self.0.footprint()
-    }
-    fn allocate(&mut self) {
-        self.0.allocate();
-    }
-    fn latency(&mut self) -> Option<f64> {
-        self.0.latency()
-    }
-    fn tail(&mut self) -> Tail {
-        self.0.tail()
-    }
-}
-
 /// Why [`AudioGraphRes::replace`](super::AudioGraphRes::replace) did not
-/// take a unit — or, as `ReplaceRefused<Box<PluginClient>>`,
+/// take a node — or, as `ReplaceRefused<Box<PluginClient>>`,
 /// `AudioGraphRes::replace_plugin` a plugin.
-pub enum ReplaceRefused<U = Box<dyn AudioUnit>> {
+pub enum ReplaceRefused<U> {
     /// Not now: the graph is re-preparing (a sample-rate or block-size change
-    /// between its two commits). The unit is handed back, untouched; retry
+    /// between its two commits). The node is handed back, untouched; retry
     /// once the re-prepare has resumed —
     /// [`crossfade_audio_node`](super::crossfade_audio_node) keeps it pending
     /// and does.
     Busy(U),
     /// Never: the graph is poisoned (a re-prepare failed with its units out),
-    /// or the node is not in it. The unit was dropped.
+    /// or the node is not in it. The incoming node was dropped.
     Failed(String),
 }
 
@@ -197,18 +86,12 @@ impl<U> std::fmt::Debug for ReplaceRefused<U> {
     }
 }
 
-/// One node's handle, and its controls when it has a settings path.
+/// One node's handle, and its params by address when it has any.
 struct Entry {
     node: AudioNode,
-    /// `None` for a native node (the beat generator), which takes no
-    /// settings and has no `AudioUnit` to inspect.
-    controls: Option<LegacyControls<Boxed>>,
-    /// Whether a fork of the unit now at the key carries the MIDI clip on
-    /// its live port: it went in with the fork its captured port asks for
-    /// (`insert_with`), or is a plugin (whose fork source carries its own).
-    /// A node an export reaches that has a captured port and not this is
-    /// refused (`fork_for_export`) — its fork would drop the clip.
-    carries_midi: bool,
+    /// What [`set_param`](GraphRuntime::set_param) writes through, and what a
+    /// fork of the node starts from.
+    params: Option<ParamSet>,
 }
 
 /// The executor, while this side still holds it, and what a local render
@@ -220,7 +103,7 @@ pub(crate) struct Local {
 }
 
 /// The graph runtime. See the module docs.
-pub(crate) struct NativeGraph {
+pub(crate) struct GraphRuntime {
     editor: Editor,
     local: Option<Local>,
     nodes: BTreeMap<NodeKey, Entry>,
@@ -241,34 +124,17 @@ pub(crate) enum Committed {
     Retry,
 }
 
-/// `node`'s key: its `NodeId`'s bits. `NodeId::new` draws from a global
-/// counter, so a key minted this way is unique without a map, and
-/// [`AudioNode`] keeps wrapping a `NodeId`.
+/// `node`'s key. [`AudioNode::fresh`] draws it from
+/// [`NodeKey::fresh`]'s process-wide counter, so a key minted this way is
+/// unique without a map.
 pub(crate) fn key(node: AudioNode) -> NodeKey {
-    NodeKey(node.0.value())
-}
-
-/// The latency `Legacy` will declare for `unit` at `rate`, by `Legacy`'s own
-/// probe (`tutti-graph/src/legacy.rs`, `Adapter::probe`): `latency()` after
-/// `set_sample_rate`, rounded to the nearest frame, never negative. Asked
-/// before a replace, because a refused `Editor::replace` consumes its node.
-fn probe_latency(unit: &mut dyn AudioUnit, rate: SampleRate) -> Latency {
-    unit.set_sample_rate(rate);
-    declared_latency(unit)
-}
-
-/// `unit.latency()` as `Legacy` declares it: rounded to the nearest frame,
-/// never negative (`Adapter::probe`, whose rounding is `Net`'s own).
-fn declared_latency(unit: &mut dyn AudioUnit) -> Latency {
-    Latency::new(Samples(
-        unit.latency().unwrap_or(0.0).round().max(0.0) as usize
-    ))
+    node.0
 }
 
 /// The graph's `Prepare`: `rate`, `max_block`, and the device's callback
 /// `quantum` when the host knows it (`tutti_cpal::OutputSpec::quantum`). A
-/// hosted out-of-process plugin ships one quantum per callback to its server
-/// (doc 013, decision 8 reversed), so the quantum is what keeps its pipeline
+/// hosted out-of-process plugin ships one quantum per callback to its server,
+/// so the quantum is what keeps its pipeline
 /// in step with the device.
 pub(crate) fn prepare_for(
     rate: SampleRate,
@@ -283,7 +149,7 @@ pub(crate) fn prepare_for(
 }
 
 /// The graph's current `Prepare`.
-impl NativeGraph {
+impl GraphRuntime {
     pub(crate) fn prepared(&self) -> Prepare {
         *self.editor.prepare()
     }
@@ -300,43 +166,7 @@ pub(crate) fn clamp_latency(latency: Latency) -> Latency {
     )
 }
 
-/// How a unit's fork carries the MIDI clip on its live port, as the MIDI
-/// registry captured it (`CapturedControls`). Without the `midi` feature no
-/// unit has a captured port, and every unit forks from its shadow.
-#[cfg(feature = "midi")]
-pub(crate) type UnitFork = crate::midi::MidiFork;
-/// See the `midi` build's `UnitFork`: here there is none.
-#[cfg(not(feature = "midi"))]
-pub(crate) enum UnitFork {}
-
-/// `unit` as every unit goes in — [`Legacy::controlled`]: its node, settings
-/// ring and shadow — forking as `fork` says: from the unit's own source, or
-/// from the shadow with a hook carrying its MIDI clip (see
-/// `MidiNode::fork_source`). With no `fork`, from the shadow alone, as
-/// `Legacy` forks every forkable unit.
-fn controlled(
-    editor: &mut Editor,
-    unit: Box<dyn AudioUnit>,
-    fork: Option<UnitFork>,
-) -> (NodeParts<()>, LegacyControls<Boxed>) {
-    let (legacy, controls) = Legacy::controlled(editor, Boxed(unit));
-    let parts = match fork {
-        None => tutti_graph::IntoNode::into_parts(legacy),
-        #[cfg(feature = "midi")]
-        Some(UnitFork::Carry(hook)) => {
-            tutti_graph::IntoNode::into_parts(legacy.with_fork_hook(hook))
-        }
-        #[cfg(feature = "midi")]
-        Some(UnitFork::Own(own)) => {
-            let mut parts = tutti_graph::IntoNode::into_parts(legacy);
-            parts.fork = Some(own);
-            parts
-        }
-    };
-    (parts, controls)
-}
-
-impl NativeGraph {
+impl GraphRuntime {
     /// An empty graph with `inputs` global inputs and `outputs` global
     /// outputs, prepared for `rate` and the device's callback `quantum` (when
     /// known: see [`prepare_for`]), its executor local.
@@ -346,7 +176,7 @@ impl NativeGraph {
         rate: SampleRate,
         quantum: Option<Samples>,
     ) -> Self {
-        let (mut editor, exec) = Editor::new(prepare_for(rate, NATIVE_MAX_BLOCK, quantum));
+        let (mut editor, exec) = Editor::new(prepare_for(rate, LIVE_MAX_BLOCK, quantum));
         let topology = &mut editor.spec_mut().topology;
         topology.inputs = ChannelLayout::from_count(inputs as u16);
         topology.outputs = vec![Source::Zero; outputs];
@@ -369,7 +199,7 @@ impl NativeGraph {
     pub(crate) fn take_executor(&mut self) -> Executor {
         self.local
             .take()
-            .expect("the native graph's audio side was already taken")
+            .expect("the graph's audio side was already taken")
             .exec
     }
 
@@ -388,7 +218,7 @@ impl NativeGraph {
             current.max_block().samples(),
             current.quantum(),
         )) {
-            bevy_log::error!("native graph: re-prepare at {} Hz refused: {e}", rate.get());
+            bevy_log::error!("graph: re-prepare at {} Hz refused: {e}", rate.get());
             return;
         }
         self.pump_local();
@@ -468,61 +298,51 @@ impl NativeGraph {
 
     // --- Nodes ---
 
-    /// Insert `unit`, forking as `fork` says (see [`controlled`]): the fork
-    /// its captured MIDI port asks for, or `None` for a unit with no port.
-    pub(crate) fn insert(&mut self, unit: Box<dyn AudioUnit>, fork: Option<UnitFork>) -> AudioNode {
-        let node = AudioNode(NodeId::new());
-        let carries_midi = fork.is_some();
-        let (parts, controls) = controlled(&mut self.editor, unit, fork);
-        self.editor.insert(key(node), UNIT_KIND, parts);
+    /// Insert `node` through its own [`IntoNode`]: its controls come back to
+    /// the caller, and its fork source (which carries whatever MIDI it
+    /// plays: a clip node's events, a synth's installed clip) goes to the
+    /// editor. Address its params with [`set_node_params`](Self::set_node_params).
+    pub(crate) fn insert<N: IntoNode>(&mut self, node: N) -> (AudioNode, N::Controls) {
+        let id = AudioNode::fresh();
+        let controls = self.editor.insert(key(id), N::kind(), node);
         self.nodes.insert(
-            key(node),
+            key(id),
             Entry {
-                node,
-                controls: Some(controls),
-                carries_midi,
+                node: id,
+                params: None,
             },
         );
         self.edited = true;
-        node
+        (id, controls)
     }
 
-    /// Insert a hosted plugin: bound (`PluginClient::bind`, the typestate
-    /// transition doc 013 §2 describes) and inserted as the native node it
+    /// Insert a hosted plugin: bound (`PluginClient::bind`, its typestate
+    /// transition to a graph node) and inserted as the `Node` it
     /// then is, which hands the editor its own
     /// [`ForkSource`](tutti_graph::ForkSource) (a fork by state transfer) and
     /// declares its latency in its `Shape`.
     ///
-    /// No settings ring and no shadow: a plugin takes no `Setting`s, and the
-    /// host drives it through the `PluginControls` it captured before
-    /// inserting (`CapturedControls::for_plugin`) — so [`inspect`](Self::inspect)
-    /// answers `None` for it, and a latency change reaches the editor as the
-    /// figure those controls declare ([`refresh_node_latency`](Self::refresh_node_latency)).
+    /// The host drives it through the `PluginControls` it captured before
+    /// inserting (`CapturedControls::for_plugin`), and a latency change
+    /// reaches the editor as the figure those controls declare
+    /// ([`refresh_node_latency`](Self::refresh_node_latency)).
     #[cfg(feature = "plugin")]
     pub(crate) fn insert_plugin(
         &mut self,
         client: Box<tutti_plugin::handles::PluginClient>,
     ) -> AudioNode {
-        let node = AudioNode(NodeId::new());
+        let node = AudioNode::fresh();
         let _controls = self.editor.insert(key(node), PLUGIN_KIND, client.bind());
-        self.nodes.insert(
-            key(node),
-            Entry {
-                node,
-                controls: None,
-                // Its fork source carries the clip itself
-                // (`PluginClient::fork_source`).
-                carries_midi: true,
-            },
-        );
+        self.nodes.insert(key(node), Entry { node, params: None });
         self.edited = true;
         node
     }
 
-    /// Swap the plugin at `node` for `client`, crossfading when the running
-    /// node is a plugin of the same shape, as [`replace`](Self::replace) does
-    /// for a unit; otherwise a plain swap at the same key. Refused, handing
-    /// `client` back, while a re-prepare is between its two commits.
+    /// Swap the plugin at `node` for `client`, as [`replace`](Self::replace)
+    /// swaps any node: crossfading when the running node's shape fits the
+    /// bound plugin's (ports, latency, the rest `Editor::replace_or_swap`
+    /// checks), else a plain swap at the same key. Refused, handing `client`
+    /// back unbound, while a re-prepare is between its two commits.
     #[cfg(feature = "plugin")]
     pub(crate) fn replace_plugin(
         &mut self,
@@ -531,6 +351,8 @@ impl NativeGraph {
         fade: Seconds,
         curve: CrossfadeCurve,
     ) -> Result<(), ReplaceRefused<Box<tutti_plugin::handles::PluginClient>>> {
+        // Asked here, before binding: `replace` hands back what it refuses,
+        // and a bound plugin cannot be unbound.
         if let Some(cause) = self.editor.poisoned() {
             return Err(ReplaceRefused::Failed(format!(
                 "the graph is poisoned ({cause}); build a new one"
@@ -539,6 +361,63 @@ impl NativeGraph {
         if self.editor.is_repreparing() {
             return Err(ReplaceRefused::Busy(client));
         }
+        match self.replace(node, client.bind(), fade, curve) {
+            Ok(_controls) => Ok(()),
+            Err(ReplaceRefused::Failed(why)) => Err(ReplaceRefused::Failed(why)),
+            Err(ReplaceRefused::Busy(_)) => unreachable!("checked above"),
+        }
+    }
+
+    /// A copy of `target` for an offline render at `rate`, sharing no state
+    /// with this graph: `Editor::fork` with `ForkMode::Offline(ctx)`, through
+    /// tutti-export (`RenderGraph::fork`, which prepares it at the render's
+    /// rate and `GRAPH_MAX_BLOCK`). `ctx` is the render's timeline, the one
+    /// type `ForkMode::Offline` takes.
+    #[cfg(feature = "export")]
+    pub(crate) fn fork_for_export(
+        &self,
+        target: tutti_graph::ForkTarget,
+        ctx: &tutti_core::transport::OfflineTransport,
+        rate: SampleRate,
+    ) -> tutti_export::Result<tutti_export::RenderGraph> {
+        tutti_export::RenderGraph::fork(
+            &self.editor,
+            target,
+            tutti_graph::ForkMode::Offline(ctx),
+            rate,
+        )
+    }
+
+    /// Address `node`'s params by `params` (a `ParamNode`'s controls), so
+    /// [`set_param`](Self::set_param) and the fork snapshot reach it.
+    pub(crate) fn set_node_params(&mut self, node: AudioNode, params: Option<ParamSet>) {
+        if let Some(entry) = self.nodes.get_mut(&key(node)) {
+            entry.params = params;
+        }
+    }
+
+    /// Swap the unit behind `node` for `incoming` under a `fade`
+    /// along `curve` when its shape fits the running unit's, else as a plain
+    /// swap on the next commit (`Editor::replace_or_swap`). Hands back its
+    /// controls; the caller addresses its params
+    /// ([`set_node_params`](Self::set_node_params)). Refused as
+    /// [`ReplaceRefused::Busy`] with the node handed back while the graph
+    /// re-prepares, and for good on a poisoned graph.
+    pub(crate) fn replace<N: IntoNode>(
+        &mut self,
+        node: AudioNode,
+        incoming: N,
+        fade: Seconds,
+        curve: CrossfadeCurve,
+    ) -> Result<N::Controls, ReplaceRefused<N>> {
+        if let Some(cause) = self.editor.poisoned() {
+            return Err(ReplaceRefused::Failed(format!(
+                "the graph is poisoned ({cause}); build a new one"
+            )));
+        }
+        if self.editor.is_repreparing() {
+            return Err(ReplaceRefused::Busy(incoming));
+        }
         let k = key(node);
         if !self.nodes.contains_key(&k) {
             return Err(ReplaceRefused::Failed(format!(
@@ -546,108 +425,84 @@ impl NativeGraph {
             )));
         }
         let rate = self.editor.prepare().sample_rate();
-        let incoming = client.controls().declared_latency();
-        let running = self
+        let controls = self
             .editor
-            .base()
-            .and_then(|plan| plan.unit(k))
-            .map(|u| u.shape)
-            .filter(|_| self.editor.spec().topology.nodes.contains_key(&k));
-        // A plugin fades only from a plugin: the same ports and latency, and
-        // the plugin node's own in-place and resolution declarations
-        // (`Editor::replace` checks the shape, and consumes what it refuses).
-        let fits = running.is_some_and(|s| {
-            s.audio_in.count() as usize == client.inputs()
-                && s.audio_out.count() as usize == client.outputs()
-                && s.event_in == 0
-                && s.event_out == 0
-                && !s.in_place
-                && s.event_resolution == Resolution::Sample
-                && s.legacy
-                && s.latency == incoming
-        });
-        let bound = client.bind();
-        if fits {
-            let fade = Fade::seconds(fade, rate, curve);
-            if let Err(e) = self.editor.replace(k, bound, fade) {
-                debug_assert!(false, "a checked replace was refused: {e}");
-                return Err(ReplaceRefused::Failed(e.to_string()));
-            }
-        } else {
-            let _controls = self.editor.insert(k, PLUGIN_KIND, bound);
-        }
+            .replace_or_swap(k, incoming, Fade::seconds(fade, rate, curve))
+            .map_err(|e| ReplaceRefused::Failed(e.to_string()))?;
         if let Some(entry) = self.nodes.get_mut(&k) {
-            entry.controls = None;
-            entry.carries_midi = true;
+            entry.params = None;
         }
         self.edited = true;
-        Ok(())
+        Ok(controls)
     }
 
-    /// A copy of `target` for an offline render at `rate`, sharing no state
-    /// with this graph: `Editor::fork` with `ForkMode::Offline(ctx)`, through
-    /// tutti-export (`RenderGraph::fork`, which prepares it at the render's
-    /// rate and `GRAPH_MAX_BLOCK`). `ctx` is the render's timeline, the one
-    /// type `ForkMode::Offline` and every unit's `rebind_offline` take.
-    ///
-    /// `midi` is every node with a captured MIDI port (its entity's
-    /// `MidiTarget`). One the fork holds that went in **without** the fork
-    /// its port asks for — a host that captured the unit's controls, then
-    /// pushed it with the plain [`insert`](Self::insert) and bound them —
-    /// would fork from its shadow and drop its clip, silently. It refuses
-    /// the export instead (`NotForkable`, naming its entity).
-    #[cfg(feature = "export")]
-    pub(crate) fn fork_for_export(
+    /// How many event inputs `node` declares.
+    pub(crate) fn node_event_inputs(&self, node: AudioNode) -> usize {
+        self.shape(node).map_or(0, |s| usize::from(s.event_in))
+    }
+
+    /// Feed `sink`'s event input `port` from exactly `sources` (fan-in merges
+    /// them by offset; the graph orders ties by source).
+    /// Touches nothing when that is what it already holds.
+    pub(crate) fn set_event_sources(
+        &mut self,
+        sink: AudioNode,
+        port: u16,
+        sources: &[crate::graph::EventSource],
+    ) {
+        let at = EventIn {
+            node: key(sink),
+            port,
+        };
+        let mut want: Vec<EventOut> = sources
+            .iter()
+            .map(|s| EventOut {
+                node: key(s.node),
+                port: s.port,
+            })
+            .collect();
+        want.sort();
+        want.dedup();
+        let spec = self.editor.spec_mut();
+        let have: Vec<EventOut> = spec
+            .events
+            .get(&at)
+            .map(|v| v.iter().map(|e| e.from()).collect())
+            .unwrap_or_default();
+        if have == want {
+            return;
+        }
+        spec.events.remove(&at);
+        for from in want {
+            spec.connect_events(at, EventEdge::Direct(from));
+        }
+        self.edited = true;
+    }
+
+    /// The event outputs feeding `sink`'s event input `port`, in the graph's
+    /// order.
+    pub(crate) fn event_sources(
         &self,
-        target: tutti_graph::ForkTarget,
-        ctx: &tutti_core::transport::OfflineTransport,
-        rate: SampleRate,
-        midi: &std::collections::BTreeSet<NodeKey>,
-    ) -> tutti_export::Result<tutti_export::RenderGraph> {
-        let graph = tutti_export::RenderGraph::fork(
-            &self.editor,
-            target,
-            tutti_graph::ForkMode::Offline(ctx),
-            rate,
-        )?;
-        // The keys the fork holds are exactly what it forked.
-        let dropped = graph.editor().spec().topology.nodes.keys().find(|k| {
-            self.nodes
-                .get(k)
-                .is_some_and(|e| !e.carries_midi && midi.contains(k))
-        });
-        if let Some(&key) = dropped {
-            return Err(tutti_export::Error::NotForkable { key });
-        }
-        Ok(graph)
-    }
-
-    /// The beat generator a graph engine needs in place of a
-    /// `TransportClock`, which the graph must not hold (see `Engine::new`:
-    /// the engine drives its own).
-    ///
-    /// Forkable by clone (`ForkByClone`): it is a unit struct that reads only
-    /// its block's `Env`, so a clone shares nothing, and a fork's renderer
-    /// hands it the render's transport. Inserted plainly it would have no
-    /// fork source, and every engine-built graph (whose click and beat-driven
-    /// nodes it feeds) would refuse a master export as not forkable.
-    pub(crate) fn insert_env_clock(&mut self) -> AudioNode {
-        let node = AudioNode(NodeId::new());
-        self.editor.insert(
-            key(node),
-            ENV_CLOCK_KIND,
-            tutti_graph::ForkByClone(EnvClock::new()),
-        );
-        self.nodes.insert(
-            key(node),
-            Entry {
-                node,
-                controls: None,
-                carries_midi: false,
-            },
-        );
-        self.edited = true;
-        node
+        sink: AudioNode,
+        port: u16,
+    ) -> Vec<crate::graph::EventSource> {
+        let at = EventIn {
+            node: key(sink),
+            port,
+        };
+        self.editor
+            .spec()
+            .events
+            .get(&at)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| {
+                let from = e.from();
+                self.nodes
+                    .get(&from.node)
+                    .map(|n| crate::graph::EventSource::new(n.node, from.port))
+            })
+            .collect()
     }
 
     pub(crate) fn remove(&mut self, node: AudioNode) -> bool {
@@ -663,129 +518,35 @@ impl NativeGraph {
         self.nodes.contains_key(&key(node))
     }
 
-    /// Swap the unit at `node`, crossfading when the running unit can fade to
-    /// it; otherwise a plain swap.
-    ///
-    /// `Editor::replace` fades only between units of one shape (ports,
-    /// latency, in-place acceptance, event resolution; doc 013, PR 3) and
-    /// only from a unit that is running (`Net::crossfade`, before PR 13,
-    /// asked neither). So
-    /// where the fade cannot be had — the node is not committed yet, or the
-    /// new unit declares another latency — this lands the unit with
-    /// `Editor::insert` instead: the same key, every edge kept, heard as a
-    /// swap on the commit's block. Checked here rather than by trying,
-    /// because a refused `replace` has already consumed the unit.
-    ///
-    /// Refused, handing `unit` back, while a re-prepare is between its two
-    /// commits (`Editor::replace` would consume it and refuse): the caller
-    /// keeps it and retries once the re-prepare has resumed. Refused for good
-    /// on a poisoned editor, where no unit can ever land again.
-    ///
-    /// `fork` is the incoming unit's (see [`insert`](Self::insert)), taken
-    /// only when the unit lands, so a refused unit keeps it for its retry.
-    pub(crate) fn replace(
-        &mut self,
-        node: AudioNode,
-        mut unit: Box<dyn AudioUnit>,
-        fade: Seconds,
-        curve: CrossfadeCurve,
-        fork: &mut Option<UnitFork>,
-    ) -> Result<(), ReplaceRefused> {
-        if let Some(cause) = self.editor.poisoned() {
-            return Err(ReplaceRefused::Failed(format!(
-                "the graph is poisoned ({cause}); build a new one"
-            )));
-        }
-        if self.editor.is_repreparing() {
-            return Err(ReplaceRefused::Busy(unit));
-        }
-        let k = key(node);
-        let Some(entry) = self.nodes.get(&k) else {
-            return Err(ReplaceRefused::Failed(format!(
-                "{node:?} is not in the graph"
-            )));
-        };
-        let rate = self.editor.prepare().sample_rate();
-        let running = self
-            .editor
-            .base()
-            .and_then(|plan| plan.unit(k))
-            .map(|u| u.shape)
-            .filter(|_| self.editor.spec().topology.nodes.contains_key(&k))
-            // A native node at the key (the beat generator) is not what a
-            // `Legacy` can fade from: its in-place and resolution differ.
-            .filter(|_| entry.controls.is_some());
-        let fits = running.is_some_and(|s| {
-            s.audio_in.count() as usize == unit.inputs()
-                && s.audio_out.count() as usize == unit.outputs()
-                && s.event_in == 0
-                && s.event_out == 0
-                && s.in_place
-                && s.event_resolution == Resolution::Block
-                && s.latency == probe_latency(unit.as_mut(), rate)
-        });
-        let fork = fork.take();
-        let carries_midi = fork.is_some();
-        let (legacy, controls) = controlled(&mut self.editor, unit, fork);
-        if fits {
-            let fade = Fade::seconds(fade, rate, curve);
-            if let Err(e) = self.editor.replace(k, legacy, fade) {
-                // Every refusal `Editor::replace` has is checked above
-                // (poisoned, repreparing, not running, shape); one here is
-                // this module's bug, and the unit is gone with it.
-                debug_assert!(false, "a checked replace was refused: {e}");
-                return Err(ReplaceRefused::Failed(e.to_string()));
-            }
-        } else {
-            let kind = self.editor.spec().topology.nodes[&k].kind.clone();
-            self.editor.insert(k, &kind, legacy);
-        }
-        if let Some(entry) = self.nodes.get_mut(&k) {
-            entry.controls = Some(controls);
-            entry.carries_midi = carries_midi;
-        }
-        self.edited = true;
-        Ok(())
-    }
-
-    /// Send `param`'s setting through `node`'s ring, and apply it to its
-    /// shadow. Lands on the unit at the start of the executor's next block
-    /// (see "`set_param` lands on the next block" in the module docs). A full
-    /// ring holds the setting control-side; the next `collect` flushes it.
+    /// Write `param` through `node`'s [`ParamSet`]: the cell the node reads
+    /// at the start of its next block (see "`set_param` lands on the next
+    /// block" in the module docs), and the authored value a fork starts
+    /// from. A node with no set, or no such param, takes nothing.
     pub(crate) fn set_param(&mut self, node: AudioNode, param: UnitParam, value: f32) {
-        let Some(controls) = self
-            .nodes
-            .get_mut(&key(node))
-            .and_then(|e| e.controls.as_mut())
-        else {
-            return;
-        };
-        let _ = controls.set(tutti_core::unit_param::setting(param, value));
+        if let Some(params) = self.nodes.get(&key(node)).and_then(|e| e.params.as_ref()) {
+            params.set(param, value);
+        }
     }
 
-    /// Apply `param`'s setting to `node`'s shadow **only** — what a fork of the
-    /// node starts from — leaving the live unit to whoever drives it.
+    /// Write `param`'s **authored** value only — what a fork of the node
+    /// starts from — leaving the live cell to whoever drives it.
     ///
     /// For a param the modulation driver owns: live, the driver writes
     /// `clamp(base + Σ layers)` into the node's own cell every frame, and a
-    /// ring write of the bare base would fight it for a block. A fork (an
+    /// live write of the bare base would fight it for a block. A fork (an
     /// export) is not modulated by this driver — it gets its modulation from
     /// its own offline one — so what it must carry is the authored base.
     #[cfg(feature = "modulation")]
     pub(crate) fn set_param_snapshot(&mut self, node: AudioNode, param: UnitParam, value: f32) {
-        let Some(controls) = self.nodes.get(&key(node)).and_then(|e| e.controls.as_ref()) else {
-            return;
-        };
-        controls
-            .shadow()
-            .set(tutti_core::unit_param::setting(param, value));
+        if let Some(params) = self.nodes.get(&key(node)).and_then(|e| e.params.as_ref()) {
+            params.set_authored(param, value);
+        }
     }
 
     /// A live duplicate of the whole graph that shares no state with it
     /// (`Editor::fork`, `ForkMode::Live`), as an audio side to render. Each
-    /// node is forked from its shadow, so it carries every setting sent — and
-    /// only those: a value written into a cell the live unit shares is at what
-    /// the unit's `isolate` left in the shadow.
+    /// node is forked from its own fork source: a [`ParamNode`](tutti_graph::ParamNode)
+    /// from its set's authored values.
     #[cfg(test)]
     pub(crate) fn fork(&self) -> Result<AudioSide, tutti_graph::ForkError> {
         let (editor, exec) = self.editor.fork(
@@ -794,18 +555,6 @@ impl NativeGraph {
             *self.editor.prepare(),
         )?;
         Ok(AudioSide::forked(editor, exec))
-    }
-
-    /// `f` over `node`'s shadow: an isolated copy with every setting sent
-    /// applied, never processed. `None` for a native node.
-    pub(crate) fn inspect<R>(
-        &self,
-        node: AudioNode,
-        f: impl FnOnce(&dyn AudioUnit) -> R,
-    ) -> Option<R> {
-        let controls = self.nodes.get(&key(node))?.controls.as_ref()?;
-        let shadow = controls.shadow();
-        Some(f(shadow.0.as_ref()))
     }
 
     // --- Edges ---
@@ -867,7 +616,7 @@ impl NativeGraph {
         self.edited = true;
     }
 
-    // --- Param modulation (design doc 013 item 6) ---
+    // --- Param modulation ---
 
     /// Whether `node` declares `param` modulatable (its shape's params).
     pub(crate) fn declares_param(&self, node: AudioNode, param: UnitParam) -> bool {
@@ -1028,8 +777,10 @@ impl NativeGraph {
 
     // --- Latency ---
 
+    /// Over the whole spec, so event and param sources count toward a node's
+    /// arrival as the compiler counts them.
     pub(crate) fn latency_plan(&self) -> Compensation {
-        tutti_types::latency::plan(&self.editor.spec().topology)
+        tutti_types::latency::plan(self.editor.spec())
     }
 
     /// The compensation the next commit's plan carries: the spec compiled
@@ -1060,7 +811,7 @@ impl NativeGraph {
     /// plugin is `PluginControls::declared_latency` (its own figure **plus**
     /// the chunk its pipeline holds) — to the editor (`Editor::set_latency`),
     /// so the next commit moves PDC to it without touching the running node.
-    /// Doc 013: a latency change is a `Shape` change in the next commit.
+    /// A latency change is a `Shape` change in the next commit.
     ///
     /// Returns whether the editor's figure moved. `tests/plugin_capture.rs`
     /// pins the path.
@@ -1083,7 +834,7 @@ impl NativeGraph {
                 true
             }
             Err(e) => {
-                bevy_log::error!("native graph: latency of {node:?} refused: {e}");
+                bevy_log::error!("graph: latency of {node:?} refused: {e}");
                 false
             }
         }
@@ -1091,8 +842,7 @@ impl NativeGraph {
 
     // --- Publishing and rendering ---
 
-    /// Drain what the executor sent back, freeing retired units here, and
-    /// flush every node's held settings.
+    /// Drain what the executor sent back, freeing retired units here.
     pub(crate) fn collect(&mut self) {
         self.editor.collect();
     }
@@ -1108,19 +858,20 @@ impl NativeGraph {
             Err(e) => {
                 // Not retried: the same spec fails the same way next frame.
                 // The next edit marks the graph dirty again.
-                bevy_log::error!("native graph: commit refused: {e}");
+                bevy_log::error!("graph: commit refused: {e}");
                 Committed::Done
             }
         }
     }
 
-    /// Render one frame on a local executor, committing any edit first.
+    /// Render one frame on a local executor, committing any edit first,
+    /// with the transport at `transport`.
     ///
     /// # Panics
     ///
     /// If the executor was taken: there is no control-side copy of any node
     /// to render instead (see the module docs).
-    pub(crate) fn render_frame(&mut self, output: &mut [f32]) {
+    pub(crate) fn render_frame_at(&mut self, transport: &Transport, output: &mut [f32]) {
         assert!(
             self.local.is_some(),
             "render_frame needs the audio side, and it was taken; \
@@ -1130,13 +881,7 @@ impl NativeGraph {
             let _ = self.commit();
         }
         let local = self.local.as_mut().expect("checked above");
-        render(
-            &mut local.exec,
-            &mut local.scratch,
-            &Transport::default(),
-            &[],
-            output,
-        );
+        render(&mut local.exec, &mut local.scratch, transport, &[], output);
     }
 }
 
@@ -1183,7 +928,7 @@ pub struct AudioSide {
 }
 
 impl AudioSide {
-    pub(crate) fn native(exec: Executor) -> Self {
+    pub(crate) fn live(exec: Executor) -> Self {
         Self {
             exec,
             transport: Transport::default(),
@@ -1203,7 +948,7 @@ impl AudioSide {
         }
     }
 
-    /// Render one frame: `input` one sample per global input, `output` one
+    /// Renders one frame: `input` one sample per global input, `output` one
     /// per global output. Commits sent since the last call land first.
     pub fn tick(&mut self, input: &[f32], output: &mut [f32]) {
         render(
@@ -1215,10 +960,18 @@ impl AudioSide {
         );
     }
 
-    /// Render `frames` frames with no global input into `output`, planar,
+    /// The transport every block from here on renders under, as a device's
+    /// engine hands its graph the playhead: a node that reads the transport
+    /// from its `Env` (a placed sampler voice) plays on it. Stopped at beat
+    /// zero until set.
+    pub fn set_transport(&mut self, transport: Transport) {
+        self.transport = transport;
+    }
+
+    /// Renders `frames` frames with no global input into `output`, planar,
     /// one slice per global output, in the blocks a device would hand over:
-    /// executor blocks of up to `block` frames. The transport is stopped at
-    /// beat zero.
+    /// executor blocks of up to `block` frames, each under the transport
+    /// last [set](Self::set_transport) (stopped at beat zero until one is).
     ///
     /// # Panics
     ///
@@ -1254,10 +1007,10 @@ impl AudioSide {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use bevy_app::prelude::*;
-    use tutti_core::{AtomicF32, Drive, Ordering, Signal};
+    use tutti_core::Drive;
+    use tutti_graph::NodeParts;
 
     use crate::graph::{
         AudioGraphRes, AudioParam, AudioParamAppExt, GraphReconcilePlugin, MasterSources,
@@ -1269,18 +1022,14 @@ mod tests {
 
     type DriveParam = AudioParam<Drive, { UnitParam::Drive as u16 }>;
 
-    /// A source whose one output is its `Drive` param, held in a shared cell —
-    /// the shape of every node whose param a host drives (`DistortionNode`'s
-    /// drive, a filter's cutoff): a `set` writes the cell, a clone shares it.
-    ///
-    /// Its `isolate` **snapshots the cell**, as every in-tree unit's does once
-    /// its `Param` cells are isolated (#29): so a fork of it carries exactly
-    /// what reached its shadow, and a write into the live cell does not leak
-    /// into the fork through a shared `Arc`. That is what lets this test tell a
-    /// path that goes through the settings ring from one that does not.
+    /// A source whose one output is its `Drive` param — the shape of every
+    /// node whose param a host drives (`DistortionNode`'s drive, a filter's
+    /// cutoff): its drive a `Param` cell addressed by a `ParamSet`, inserted
+    /// through `param_parts` (so its fork starts from the set's authored
+    /// values) and spawned as a `GraphNode` with its params.
     #[derive(Clone)]
     struct Knob {
-        drive: Arc<AtomicF32>,
+        drive: tutti_types::Param<Drive>,
     }
 
     impl Knob {
@@ -1292,108 +1041,81 @@ mod tests {
 
         fn at(drive: f32) -> Self {
             Self {
-                drive: Arc::new(AtomicF32::new(drive)),
+                drive: tutti_types::Param::new(Drive(drive)),
             }
         }
     }
 
-    impl AudioUnit for Knob {
-        fn isolate(&mut self) {
-            self.drive = Arc::new(AtomicF32::new(self.drive.load(Ordering::Acquire)));
+    impl tutti_graph::Node for Knob {
+        fn shape(&self) -> tutti_graph::Shape {
+            tutti_graph::Shape::audio(ChannelLayout::EMPTY, ChannelLayout::MONO)
         }
-        fn tick(&mut self, _: &[f32], output: &mut [f32]) {
-            output[0] = self.drive.load(Ordering::Acquire);
+        fn prepare(&mut self, _: &Prepare) {}
+        fn process(
+            &mut self,
+            _: &tutti_graph::Cx<'_>,
+            mut io: tutti_graph::Io<'_>,
+        ) -> tutti_graph::Status {
+            io.output(0).fill(self.drive.load().get());
+            tutti_graph::Status::Modified
         }
-        fn process(&mut self, size: usize, _: &BufferRef, output: &mut BufferMut) {
-            let v = self.drive.load(Ordering::Acquire);
-            for i in 0..size {
-                output.set_f32(0, i, v);
-            }
+        fn reset(&mut self) {}
+    }
+
+    impl tutti_graph::ParamNode for Knob {
+        fn param_set(&self) -> ParamSet {
+            ParamSet::builder()
+                .param(UnitParam::Drive, self.drive.as_atomic())
+                .build()
         }
-        fn set(&mut self, setting: Setting) {
-            if let Some((UnitParam::Drive, v)) = tutti_core::unit_param::from_setting(&setting) {
-                self.drive.store(v, Ordering::Release);
-            }
-        }
-        fn inputs(&self) -> usize {
-            0
-        }
-        fn outputs(&self) -> usize {
-            1
-        }
-        fn route(&mut self, _: &SignalFrame, _: f64) -> SignalFrame {
-            let mut out = SignalFrame::new(1);
-            out.set(0, Signal::Latency(0.0));
-            out
-        }
-        fn get_id(&self) -> u64 {
-            0
-        }
-        fn as_any(&self) -> &dyn core::any::Any {
-            self
-        }
-        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
-            self
-        }
-        fn tail(&mut self) -> Tail {
-            Tail::None
+        fn fork_fresh(&self) -> Self {
+            let mut fork = self.clone();
+            fork.drive.detach();
+            fork
         }
     }
 
-    #[cfg(feature = "modulation")]
-    impl tutti_mod::ModParams for Knob {
-        fn mod_target(
-            &self,
-            param: tutti_types::ParamAddr,
-            base: f32,
-            min: f32,
-            max: f32,
-        ) -> Option<Arc<dyn tutti_mod::ModTarget>> {
-            (param == tutti_types::ParamAddr::Unit(UnitParam::Drive)).then(|| {
-                Arc::new(tutti_mod::AtomicTarget::with_mirror(
-                    base,
-                    min,
-                    max,
-                    Arc::clone(&self.drive),
-                )) as Arc<dyn tutti_mod::ModTarget>
-            })
+    impl IntoNode for Knob {
+        type Controls = ParamSet;
+        fn into_parts(self) -> NodeParts<ParamSet> {
+            tutti_graph::param_parts(self)
         }
     }
 
-    /// **Every bevy path that writes a param by value reaches a fork of the
-    /// node** — the constraint export by `Editor::fork`
-    /// (doc 013, PR 12) rests on: a fork is cloned from each node's shadow, so a
-    /// write that bypasses the settings ring (a captured handle, a shared cell)
-    /// moves the live unit and leaves the fork at the value it was built with.
+    impl crate::graph::GraphNode for Knob {
+        fn captured(&self) -> crate::graph::CapturedControls {
+            crate::graph::CapturedControls::for_params(&tutti_graph::ParamNode::param_set(self))
+        }
+        fn params(controls: &ParamSet) -> Option<ParamSet> {
+            Some(controls.clone())
+        }
+    }
+
+    /// **Every param write path reaches a fork of a node** — the constraint
+    /// export by `Editor::fork` rests on — through the
+    /// node's `ParamSet`: `AudioParam` and `set_param` write the live cell and the authored
+    /// value, a param the control-rate driver owns gets its base as the
+    /// authored value only (the live cell is the driver's), and a fork
+    /// starts from the authored values. Under `modulation` the set addresses
+    /// the cells as control-rate targets (`CapturedControls::for_params`).
     ///
     /// The paths, one knob each, rendered on one global output each:
-    /// - `AudioParam` on an unmodulated param (`write_param` → `set_param`);
-    /// - `AudioGraphRes::set_param` called directly;
-    /// - `AudioParam` on a param the control-rate driver owns
-    ///   (`write_param` → `ModulationMatrix::set_base`): the fork carries the
-    ///   authored **base**; and a param the driver owns with no write at all
-    ///   carries the base its rebuild seeded from `ModParamRange`. The
-    ///   driver's live offset is the exception — a fork
-    ///   (an export) runs its own modulation — and the live render shows it is
-    ///   there, so the fork's plain base is not the driver doing nothing.
-    ///
-    /// An audio-rate modulated param is the first path: the graph's param
-    /// modulation rides on the node's own control (design doc 013 item 6),
-    /// so its authored base goes through `set_param` like any unmodulated
-    /// write. (It used to live in a base chain's cell no `Setting` reached,
-    /// which a fork could not see.)
+    /// `AudioParam` on an unmodulated param (`write_param` → `set_param`);
+    /// `AudioGraphRes::set_param` directly; `AudioParam` on a param the
+    /// control-rate driver owns (`write_param` → `ModulationMatrix::set_base`:
+    /// the fork carries the authored **base**); and a param the driver owns
+    /// with no write at all (the base its rebuild seeded from
+    /// `ModParamRange`). The driver's live offset is the exception — a fork
+    /// (an export) runs its own modulation — and the live render shows it is
+    /// there, so the fork's plain base is not the driver doing nothing.
     ///
     /// Mutations (run; each fails its channel):
-    /// - `write_param`'s unmodulated arm not going through `graph.set_param`
-    ///   (the value lands wherever a captured handle points, which the shadow
-    ///   never sees) → channel 0 stays at 1;
-    /// - `write_param` dropping `set_param_snapshot` after `set_base` (the
-    ///   base reaches only the driver's accumulator) → channel 2 stays at 1;
-    /// - the modulation `rebuild` dropping its `set_param_snapshot` of
-    ///   `range.base` → channel 3 stays at 1.
-    ///
-    /// Channel 1 pins `set_param` itself; a mutation of it is `LegacyControls`'
-    /// own (`tutti-graph`'s `legacy` tests), since this crate only calls it.
+    /// - `GraphRuntime::set_param` skipping a node's `ParamSet` → channels 0
+    ///   and 1 stay at 1;
+    /// - `set_param_snapshot` skipping it → channel 2 forks at the live
+    ///   composite, not 6 (and channel 3 not at 2.5);
+    /// - `insert_and_bind` not addressing the params
+    ///   (`set_node_params`) → channels 0 and 1 stay at 1.
     #[test]
     fn every_param_write_path_reaches_a_fork() {
         let mut graph = AudioGraphRes::headless(0, 4);
@@ -1408,10 +1130,6 @@ mod tests {
                 tutti_core::transport::Transport::new(48_000.0),
             ));
             app.add_plugins(crate::modulation::TuttiModulationPlugin);
-            // Before any knob is bound: the registry is read at capture.
-            app.world_mut()
-                .resource_mut::<crate::modulation::ModTargetRegistry>()
-                .register::<Knob>();
         }
         app.add_audio_param::<Drive, { UnitParam::Drive as u16 }>();
 
@@ -1427,16 +1145,13 @@ mod tests {
         app.world_mut().flush();
         app.update();
 
-        // Path 1: an `AudioParam` on an unmodulated param.
         app.world_mut()
             .entity_mut(knobs[0])
             .insert(DriveParam::new(Drive(4.0)));
-        // Path 2: the graph's own `set_param`.
         let node = *app.world().get::<AudioNode>(knobs[1]).unwrap();
         app.world_mut()
             .resource_mut::<AudioGraphRes>()
             .set_param(node, UnitParam::Drive, 5.0);
-        // Path 3: an `AudioParam` on a param the control-rate driver owns.
         #[cfg(feature = "modulation")]
         {
             use crate::modulation::{LfoShape, ModParamRange, ModRoute, ModSource, ModSourceRate};
@@ -1445,8 +1160,6 @@ mod tests {
             app.world_mut()
                 .entity_mut(knobs[2])
                 .insert(ModParamRange::default().with(drive, 1.0, 0.0, 10.0));
-            // A square at zero rate: a constant offset, so the live value
-            // stands visibly off the base.
             let lfo = app
                 .world_mut()
                 .spawn((
@@ -1456,9 +1169,6 @@ mod tests {
                 .id();
             app.world_mut()
                 .spawn(ModRoute::new(lfo, knobs[2], drive).with_depth(Depth(0.2)));
-            // Path 4: the base the modulation rebuild seeds from the declared
-            // range, with no write at all — 2.5, not the 1 the knob was built
-            // with.
             app.world_mut()
                 .entity_mut(knobs[3])
                 .insert(ModParamRange::default().with(drive, 2.5, 0.0, 10.0));
@@ -1472,6 +1182,12 @@ mod tests {
         app.update();
         app.update();
 
+        let mut live = [0.0f32; 4];
+        app.world_mut()
+            .resource_mut::<AudioGraphRes>()
+            .render_frame(&mut live);
+        assert_eq!(live[0], 4.0, "an AudioParam write reaches the live node");
+        assert_eq!(live[1], 5.0, "a set_param write reaches the live node");
         let graph = app.world().resource::<AudioGraphRes>();
         let mut fork = graph.fork().expect("every knob is forkable");
         let mut forked = [0.0f32; 4];
@@ -1485,10 +1201,6 @@ mod tests {
                 forked[3], 2.5,
                 "the base a modulation rebuild seeds from the range reaches the fork"
             );
-            let mut live = [0.0f32; 4];
-            app.world_mut()
-                .resource_mut::<AudioGraphRes>()
-                .render_frame(&mut live);
             assert!(
                 (live[2] - 6.0).abs() > 0.5,
                 "the live knob is modulated off its base (got {}), so the fork's \
@@ -1531,9 +1243,6 @@ mod tests {
                 tutti_core::transport::Transport::new(48_000.0),
             ));
             app.add_plugins(crate::modulation::TuttiModulationPlugin);
-            app.world_mut()
-                .resource_mut::<crate::modulation::ModTargetRegistry>()
-                .register::<Knob>();
         }
         let knob = app
             .world_mut()
@@ -1554,11 +1263,7 @@ mod tests {
         app.world_mut()
             .resource_mut::<AudioGraphRes>()
             .set_sample_rate(tutti_core::SampleRate(44_100.0));
-        crate::graph::crossfade_audio_node(
-            &mut app.world_mut().commands(),
-            knob,
-            Box::new(Knob::at(3.0)),
-        );
+        crate::graph::crossfade_audio_node(&mut app.world_mut().commands(), knob, Knob::at(3.0));
         app.world_mut().flush();
         assert_eq!(
             app.world()
@@ -1602,39 +1307,26 @@ mod tests {
         }
     }
 
-    /// A unit that cannot run above 90 kHz: its `set_sample_rate` panics
-    /// there, which is how a re-prepare poisons an editor.
-    #[derive(Clone)]
+    /// A node that cannot run above 90 kHz: its `prepare` panics there,
+    /// which is how a re-prepare poisons an editor.
     struct Grenade;
 
-    impl AudioUnit for Grenade {
-        fn set_sample_rate(&mut self, rate: tutti_core::SampleRate) {
-            assert!(rate.get() < 90_000.0, "no such rate");
+    impl tutti_graph::Node for Grenade {
+        fn shape(&self) -> tutti_graph::Shape {
+            tutti_graph::Shape::audio(ChannelLayout::EMPTY, ChannelLayout::MONO)
         }
-        fn tick(&mut self, _: &[f32], output: &mut [f32]) {
-            output[0] = 0.0;
+        fn prepare(&mut self, prepare: &Prepare) {
+            assert!(prepare.sample_rate().get() < 90_000.0, "no such rate");
         }
-        fn process(&mut self, _: usize, _: &BufferRef, _: &mut BufferMut) {}
-        fn inputs(&self) -> usize {
-            0
+        fn process(
+            &mut self,
+            _: &tutti_graph::Cx<'_>,
+            mut io: tutti_graph::Io<'_>,
+        ) -> tutti_graph::Status {
+            io.output(0).fill(0.0);
+            tutti_graph::Status::Modified
         }
-        fn outputs(&self) -> usize {
-            1
-        }
-        fn route(&mut self, _: &SignalFrame, _: f64) -> SignalFrame {
-            let mut out = SignalFrame::new(1);
-            out.set(0, Signal::Latency(0.0));
-            out
-        }
-        fn get_id(&self) -> u64 {
-            0
-        }
-        fn as_any(&self) -> &dyn core::any::Any {
-            self
-        }
-        fn as_any_mut(&mut self) -> &mut dyn core::any::Any {
-            self
-        }
+        fn reset(&mut self) {}
     }
 
     /// **On a poisoned graph a crossfade is refused and logged**: nothing is
@@ -1642,7 +1334,7 @@ mod tests {
     /// as they were — the incoming unit's are not bound to a node it never
     /// reached.
     ///
-    /// Mutation (run): `NativeGraph::replace` answering `Busy` on a poisoned
+    /// Mutation (run): `GraphRuntime::replace` answering `Busy` on a poisoned
     /// graph → the request is parked for good, and this fails.
     #[test]
     fn a_crossfade_on_a_poisoned_graph_is_refused_and_keeps_the_controls() {
@@ -1658,13 +1350,10 @@ mod tests {
                 tutti_core::transport::Transport::new(48_000.0),
             ));
             app.add_plugins(crate::modulation::TuttiModulationPlugin);
-            app.world_mut()
-                .resource_mut::<crate::modulation::ModTargetRegistry>()
-                .register::<Knob>();
         }
         let mut commands = app.world_mut().commands();
         let knob = commands.spawn_audio_node(Knob::new()).id();
-        commands.spawn_audio_node(Grenade);
+        commands.spawn_audio_node(tutti_graph::Unforkable(Grenade));
         app.world_mut().flush();
         app.update();
         // Both halves run here (the executor is local); the second panics in
@@ -1675,11 +1364,7 @@ mod tests {
         #[cfg(feature = "modulation")]
         let before = handle_ptr(&app, knob);
 
-        crate::graph::crossfade_audio_node(
-            &mut app.world_mut().commands(),
-            knob,
-            Box::new(Knob::at(3.0)),
-        );
+        crate::graph::crossfade_audio_node(&mut app.world_mut().commands(), knob, Knob::at(3.0));
         app.world_mut().flush();
         app.update();
         assert!(
@@ -1699,7 +1384,7 @@ mod tests {
         let handle = app
             .world()
             .get::<crate::modulation::ModParamsHandle>(entity)
-            .expect("a registered knob has a handle");
+            .expect("a knob's params are captured");
         std::ptr::from_ref(handle.params()).cast()
     }
 
@@ -1710,7 +1395,7 @@ mod tests {
         let handle = app
             .world()
             .get::<crate::modulation::ModParamsHandle>(entity)
-            .expect("a registered knob has a handle");
+            .expect("a knob's params are captured");
         handle
             .params()
             .mod_target(
